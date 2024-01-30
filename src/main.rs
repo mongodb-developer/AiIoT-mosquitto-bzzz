@@ -5,7 +5,11 @@ use std::{
 };
 
 use esp_idf_svc::hal::{
-    gpio::OutputPin, peripheral::Peripheral, peripherals::Peripherals, rmt::RmtChannel,
+    adc::{self, attenuation, AdcChannelDriver, AdcDriver, ADC1},
+    gpio::{ADCPin, OutputPin},
+    peripheral::Peripheral,
+    peripherals::Peripherals,
+    rmt::RmtChannel,
 };
 use ws2812_esp32_rmt_driver::{
     driver::color::{LedPixelColor, LedPixelColorGrb24},
@@ -80,10 +84,27 @@ fn main() {
     let peripherals = Peripherals::take().expect("Unable to access device peripherals");
     let rmt_channel = peripherals.rmt.channel0;
     let led_pin = peripherals.pins.gpio8;
+    let adc = peripherals.adc1;
+    let adc_pin = peripherals.pins.gpio0;
     thread::scope(|scope| {
         scope.spawn(|| report_status(status, rmt_channel, led_pin));
         scope.spawn(|| change_status(status));
+        scope.spawn(|| read_noise_level(adc, adc_pin));
     });
+}
+
+fn read_noise_level<GPIO>(adc1: ADC1, adc1_pin: GPIO) -> !
+where
+    GPIO: ADCPin<Adc = ADC1>,
+{
+    let mut adc =
+        AdcDriver::new(adc1, &adc::config::Config::default()).expect("Unable to initialze ADC1");
+    let mut adc_channel: AdcChannelDriver<{ attenuation::DB_11 }, _> =
+        AdcChannelDriver::new(adc1_pin).expect("Unable to access ADC1 channel 0");
+    loop {
+        thread::sleep(Duration::from_millis(10));
+        println!("ADC value: {:?}", adc.read(&mut adc_channel));
+    }
 }
 
 fn report_status(
