@@ -97,13 +97,28 @@ fn read_noise_level<GPIO>(adc1: ADC1, adc1_pin: GPIO) -> !
 where
     GPIO: ADCPin<Adc = ADC1>,
 {
+    const LEN: usize = 5;
+    let mut sample_buffer = [0u16; LEN];
     let mut adc =
         AdcDriver::new(adc1, &adc::config::Config::default()).expect("Unable to initialze ADC1");
     let mut adc_channel: AdcChannelDriver<{ attenuation::DB_11 }, _> =
         AdcChannelDriver::new(adc1_pin).expect("Unable to access ADC1 channel 0");
     loop {
-        thread::sleep(Duration::from_millis(10));
-        println!("ADC value: {:?}", adc.read(&mut adc_channel));
+        let mut sum = 0.0f32;
+        for i in 0..LEN {
+            thread::sleep(Duration::from_millis(10));
+            if let Ok(sample) = adc.read(&mut adc_channel) {
+                sample_buffer[i] = sample;
+                sum += (sample as f32) * (sample as f32);
+            } else {
+                sample_buffer[i] = 0u16;
+            }
+        }
+        let d_b = 20.0f32 * (sum / LEN as f32).sqrt().log10();
+        println!(
+            "ADC values: {:?}, sum: {}, and dB: {} ",
+            sample_buffer, sum, d_b
+        );
     }
 }
 
