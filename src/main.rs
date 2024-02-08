@@ -15,6 +15,7 @@ use esp_idf_svc::{
         peripherals::Peripherals,
         rmt::RmtChannel,
     },
+    mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS},
     nvs::EspDefaultNvsPartition,
     wifi::{self, AuthMethod, BlockingWifi, EspWifi},
 };
@@ -65,6 +66,12 @@ struct Configuration {
     wifi_ssid: &'static str,
     #[default("NotMyPassword")]
     wifi_password: &'static str,
+    #[default("mqttserver")]
+    mqtt_host: &'static str,
+    #[default("")]
+    mqtt_user: &'static str,
+    #[default("")]
+    mqtt_password: &'static str,
 }
 
 struct ColorStep {
@@ -135,6 +142,22 @@ where
             None
         }
     };
+    const TOPIC: &str = "home/noise sensor/01";
+    let mqtt_url = if app_config.mqtt_user.is_empty() || app_config.mqtt_password.is_empty() {
+        format!("mqtt://{}/", app_config.mqtt_host)
+    } else {
+        format!(
+            "mqtt://{}:{}@{}/",
+            app_config.mqtt_user, app_config.mqtt_password, app_config.mqtt_host
+        )
+    };
+
+    let mut mqtt_client =
+        EspMqttClient::new_cb(&mqtt_url, &MqttClientConfiguration::default(), |_| {
+            log::info!("MQTT client callback")
+        })
+        .expect("Unable to initialize MQTT client");
+    let mut mqtt_msg: String;
 
     loop {
         let mut sum = 0.0f32;
@@ -148,10 +171,16 @@ where
             }
         }
         let d_b = 20.0f32 * (sum / LEN as f32).sqrt().log10();
-        println!(
-            "ADC values: {:?}, sum: {}, and dB: {} ",
-            sample_buffer, sum, d_b
-        );
+        mqtt_msg = format!("{}", d_b);
+        if let Ok(msg_id) = mqtt_client.publish(TOPIC, QoS::AtMostOnce, false, mqtt_msg.as_bytes())
+        {
+            println!(
+                "MSG ID: {}, ADC values: {:?}, sum: {}, and dB: {} ",
+                msg_id, sample_buffer, sum, d_b
+            );
+        } else {
+            println!("Unable to send MQTT msg");
+        }
     }
 }
 
