@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write,
     sync::atomic::{AtomicU8, Ordering::Relaxed},
     thread,
     time::Duration,
@@ -17,6 +18,7 @@ use esp_idf_svc::{
     },
     mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS},
     nvs::EspDefaultNvsPartition,
+    sys::{esp_base_mac_addr_get, ESP_OK},
     wifi::{self, AuthMethod, BlockingWifi, EspWifi},
 };
 use ws2812_esp32_rmt_driver::{
@@ -142,7 +144,8 @@ where
             None
         }
     };
-    const TOPIC: &str = "home/noise sensor/01";
+    let sensor_id = get_sensor_id();
+    let topic = format!("home/noise sensor/{sensor_id}");
     let mqtt_url = if app_config.mqtt_user.is_empty() || app_config.mqtt_password.is_empty() {
         format!("mqtt://{}/", app_config.mqtt_host)
     } else {
@@ -172,7 +175,7 @@ where
         }
         let d_b = 20.0f32 * (sum / LEN as f32).sqrt().log10();
         mqtt_msg = format!("{}", d_b);
-        if let Ok(msg_id) = mqtt_client.publish(TOPIC, QoS::AtMostOnce, false, mqtt_msg.as_bytes())
+        if let Ok(msg_id) = mqtt_client.publish(&topic, QoS::AtMostOnce, false, mqtt_msg.as_bytes())
         {
             println!(
                 "MSG ID: {}, ADC values: {:?}, sum: {}, and dB: {} ",
@@ -180,6 +183,26 @@ where
             );
         } else {
             println!("Unable to send MQTT msg");
+        }
+    }
+}
+
+fn get_sensor_id() -> String {
+    let mut mac_addr = [0u8; 8];
+    unsafe {
+        match esp_base_mac_addr_get(mac_addr.as_mut_ptr()) {
+            ESP_OK => {
+                let sensor_id = mac_addr.iter().fold(String::new(), |mut output, b| {
+                    let _ = write!(output, "{b:02x}");
+                    output
+                });
+                log::info!("Id: {:?}", sensor_id);
+                sensor_id
+            }
+            _ => {
+                log::error!("Unable to get id.");
+                String::from("BADCAFE00BADBEEF")
+            }
         }
     }
 }
