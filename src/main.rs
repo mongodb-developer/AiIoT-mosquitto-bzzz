@@ -1,15 +1,25 @@
 use std::{
+    fmt::Write,
     sync::atomic::{AtomicU8, Ordering::Relaxed},
     thread,
     time::Duration,
 };
 
-use esp_idf_svc::hal::{
-    adc::{self, attenuation, AdcChannelDriver, AdcDriver, ADC1},
-    gpio::{ADCPin, OutputPin},
-    peripheral::Peripheral,
-    peripherals::Peripherals,
-    rmt::RmtChannel,
+use anyhow::{bail, Context, Result};
+use esp_idf_svc::{
+    eventloop::EspSystemEventLoop,
+    hal::{
+        adc::{self, attenuation, AdcChannelDriver, AdcDriver, ADC1},
+        gpio::{ADCPin, OutputPin},
+        modem,
+        peripheral::Peripheral,
+        peripherals::Peripherals,
+        rmt::RmtChannel,
+    },
+    mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS},
+    nvs::EspDefaultNvsPartition,
+    sys::{esp_base_mac_addr_get, ESP_OK},
+    wifi::{self, AuthMethod, BlockingWifi, EspWifi},
 };
 use ws2812_esp32_rmt_driver::{
     driver::color::{LedPixelColor, LedPixelColorGrb24},
@@ -52,6 +62,20 @@ impl TryFrom<u8> for DeviceStatus {
     }
 }
 
+#[toml_cfg::toml_config]
+struct Configuration {
+    #[default("NotMyWifi")]
+    wifi_ssid: &'static str,
+    #[default("NotMyPassword")]
+    wifi_password: &'static str,
+    #[default("mqttserver")]
+    mqtt_host: &'static str,
+    #[default("")]
+    mqtt_user: &'static str,
+    #[default("")]
+    mqtt_password: &'static str,
+}
+
 struct ColorStep {
     red: u8,
     green: u8,
@@ -86,23 +110,58 @@ fn main() {
     let led_pin = peripherals.pins.gpio8;
     let adc = peripherals.adc1;
     let adc_pin = peripherals.pins.gpio0;
+    let modem = peripherals.modem;
     thread::scope(|scope| {
         scope.spawn(|| report_status(status, rmt_channel, led_pin));
-        scope.spawn(|| change_status(status));
-        scope.spawn(|| read_noise_level(adc, adc_pin));
+        thread::Builder::new()
+            .stack_size(6144)
+            .spawn_scoped(scope, || read_noise_level(status, adc, adc_pin, modem))
+            .unwrap();
     });
 }
 
-fn read_noise_level<GPIO>(adc1: ADC1, adc1_pin: GPIO) -> !
+fn read_noise_level<GPIO>(
+    status: &AtomicU8,
+    adc1: ADC1,
+    adc1_pin: GPIO,
+    modem: impl Peripheral<P = modem::Modem> + 'static,
+) -> !
 where
     GPIO: ADCPin<Adc = ADC1>,
 {
     const LEN: usize = 5;
     let mut sample_buffer = [0u16; LEN];
+    let app_config = CONFIGURATION;
     let mut adc =
         AdcDriver::new(adc1, &adc::config::Config::default()).expect("Unable to initialze ADC1");
     let mut adc_channel: AdcChannelDriver<{ attenuation::DB_11 }, _> =
         AdcChannelDriver::new(adc1_pin).expect("Unable to access ADC1 channel 0");
+    let _wifi = match connect_to_wifi(app_config.wifi_ssid, app_config.wifi_password, modem) {
+        Ok(wifi) => Some(wifi),
+        Err(err) => {
+            log::error!("Connect to WiFi: {}", err);
+            status.store(DeviceStatus::WifiError as u8, Relaxed);
+            None
+        }
+    };
+    let sensor_id = get_sensor_id();
+    let topic = format!("home/noise sensor/{sensor_id}");
+    let mqtt_url = if app_config.mqtt_user.is_empty() || app_config.mqtt_password.is_empty() {
+        format!("mqtt://{}/", app_config.mqtt_host)
+    } else {
+        format!(
+            "mqtt://{}:{}@{}/",
+            app_config.mqtt_user, app_config.mqtt_password, app_config.mqtt_host
+        )
+    };
+
+    let mut mqtt_client =
+        EspMqttClient::new_cb(&mqtt_url, &MqttClientConfiguration::default(), |_| {
+            log::info!("MQTT client callback")
+        })
+        .expect("Unable to initialize MQTT client");
+    let mut mqtt_msg: String;
+
     loop {
         let mut sum = 0.0f32;
         for i in 0..LEN {
@@ -115,10 +174,36 @@ where
             }
         }
         let d_b = 20.0f32 * (sum / LEN as f32).sqrt().log10();
-        println!(
-            "ADC values: {:?}, sum: {}, and dB: {} ",
-            sample_buffer, sum, d_b
-        );
+        mqtt_msg = format!("{}", d_b);
+        if let Ok(msg_id) = mqtt_client.publish(&topic, QoS::AtMostOnce, false, mqtt_msg.as_bytes())
+        {
+            println!(
+                "MSG ID: {}, ADC values: {:?}, sum: {}, and dB: {} ",
+                msg_id, sample_buffer, sum, d_b
+            );
+        } else {
+            println!("Unable to send MQTT msg");
+        }
+    }
+}
+
+fn get_sensor_id() -> String {
+    let mut mac_addr = [0u8; 8];
+    unsafe {
+        match esp_base_mac_addr_get(mac_addr.as_mut_ptr()) {
+            ESP_OK => {
+                let sensor_id = mac_addr.iter().fold(String::new(), |mut output, b| {
+                    let _ = write!(output, "{b:02x}");
+                    output
+                });
+                log::info!("Id: {:?}", sensor_id);
+                sensor_id
+            }
+            _ => {
+                log::error!("Unable to get id.");
+                String::from("BADCAFE00BADBEEF")
+            }
+        }
     }
 }
 
@@ -148,15 +233,39 @@ fn report_status(
     }
 }
 
-fn change_status(status: &AtomicU8) -> ! {
-    loop {
-        thread::sleep(Duration::from_secs(10));
-        if let Ok(current) = DeviceStatus::try_from(status.load(Relaxed)) {
-            match current {
-                DeviceStatus::Ok => status.store(DeviceStatus::WifiError as u8, Relaxed),
-                DeviceStatus::WifiError => status.store(DeviceStatus::MqttError as u8, Relaxed),
-                DeviceStatus::MqttError => status.store(DeviceStatus::Ok as u8, Relaxed),
-            }
-        }
+fn connect_to_wifi(
+    ssid: &str,
+    passwd: &str,
+    modem: impl Peripheral<P = modem::Modem> + 'static,
+) -> Result<Box<EspWifi<'static>>> {
+    if ssid.is_empty() {
+        bail!("No SSID defined");
     }
+    let auth_method = if passwd.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
+    let sys_loop = EspSystemEventLoop::take().context("Unable to access system event loop.")?;
+    let nvs = EspDefaultNvsPartition::take().context("Unable to access default NVS partition")?;
+    let mut esp_wifi = EspWifi::new(modem, sys_loop.clone(), Some(nvs))?;
+    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sys_loop)?;
+    wifi.set_configuration(&wifi::Configuration::Client(wifi::ClientConfiguration {
+        ssid: ssid
+            .try_into()
+            .map_err(|_| anyhow::Error::msg("Failed to use SSID"))?,
+        password: passwd
+            .try_into()
+            .map_err(|_| anyhow::Error::msg("Failed to use password"))?,
+        auth_method,
+        ..Default::default()
+    }))?;
+    wifi.start()?;
+    wifi.connect()?;
+    wifi.wait_netif_up()?;
+
+    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+    log::info!("DHCP info: {:?}", ip_info);
+
+    Ok(Box::new(esp_wifi))
 }

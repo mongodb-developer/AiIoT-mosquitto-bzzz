@@ -7,10 +7,11 @@ measurements from a noise sensor data.
 
 ## Edit and run
 
-This code uses [[https://esp-rs.github.io/book/installation/riscv.html][Rust and other tools]]. I have used Emacs (with eglot)
+This code uses [Rust and other tools](https://esp-rs.github.io/book/installation/riscv.html). I have used Emacs (with eglot)
 to edit, but you should be able to survive with Visual Studio Code.
 
-You can build and run the project using the following commands:
+Copy `cfg.toml.COPY_EDIT` to `cfg.toml` and edit the new file with your data.  You can then build and run the project using the
+following commands:
 
 ```console
 cargo b # just build
